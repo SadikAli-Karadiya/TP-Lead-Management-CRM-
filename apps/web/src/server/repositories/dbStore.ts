@@ -466,12 +466,11 @@ class StoreManager {
         Promise.all([
           prisma.user.findMany(),
           prisma.lead.findMany({
-            where: { isDeleted: false },
             orderBy: { createdAt: 'desc' },
           }),
         ]),
         new Promise<[any[], any[]]>((_, reject) =>
-          setTimeout(() => reject(new Error('Database sync timeout (2500ms)')), 2500)
+          setTimeout(() => reject(new Error('Database sync timeout (10000ms)')), 10000)
         ),
       ]);
 
@@ -531,6 +530,7 @@ class StoreManager {
       }
 
       if (dbLeads.length > 0) {
+        const dbLeadIds = new Set(dbLeads.map((l) => l.id));
         const leadMap = new Map(this.data.leads.map((l) => [l.id, l]));
 
         for (const l of dbLeads) {
@@ -579,19 +579,30 @@ class StoreManager {
           if (!existingMem) {
             leadMap.set(l.id, mappedDbLead);
           } else {
-            // Compare timestamps: Never overwrite newer in-memory assignments or status changes with stale DB reads!
-            const memUpdatedMs = new Date(existingMem.updatedAt).getTime();
-            const dbUpdatedMs = new Date(l.updatedAt).getTime();
-
-            if (dbUpdatedMs > memUpdatedMs) {
+            // Always respect database deletion status
+            if (l.isDeleted) {
               leadMap.set(l.id, mappedDbLead);
-            } else if (memUpdatedMs > dbUpdatedMs) {
-              // In-memory has pending changes (e.g. recent assignment or call outcome) - keep it and re-sync to DB
-              this.syncLeadToDatabase(existingMem).catch(() => {});
+            } else {
+              const memUpdatedMs = new Date(existingMem.updatedAt).getTime();
+              const dbUpdatedMs = new Date(l.updatedAt).getTime();
+
+              if (dbUpdatedMs >= memUpdatedMs) {
+                leadMap.set(l.id, mappedDbLead);
+              } else {
+                this.syncLeadToDatabase(existingMem).catch(() => {});
+              }
             }
           }
         }
-        this.data.leads = Array.from(leadMap.values());
+
+        // Only retain leads present in the database to prevent phantom records
+        const finalLeads: Lead[] = [];
+        for (const [id, lead] of leadMap.entries()) {
+          if (dbLeadIds.has(id)) {
+            finalLeads.push(lead);
+          }
+        }
+        this.data.leads = finalLeads;
       }
       this.lastDbSyncTime = Date.now();
       this.persist();

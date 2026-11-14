@@ -168,10 +168,10 @@ class StoreManager {
           }
         }
 
-        // Filter out any legacy dummy leads
+        // Preserve all historical leads and users - never filter out valid records
         if (Array.isArray(store.leads)) {
           const cleanLeads = store.leads.filter(
-            (l) => !l.id.startsWith('lead_10') &&
+            (l) => l && l.companyName &&
                    !l.companyName?.toLowerCase().includes('acme test') &&
                    !l.companyName?.toLowerCase().includes('noanswer corp') &&
                    !l.companyName?.toLowerCase().includes('round4 test') &&
@@ -183,9 +183,9 @@ class StoreManager {
           }
         }
 
-        // Filter out any legacy dummy users
+        // Preserve all team members and roles
         if (Array.isArray(store.users)) {
-          const cleanUsers = store.users.filter((u) => !u.id.startsWith('usr_'));
+          const cleanUsers = store.users.filter((u) => u && u.email);
           if (cleanUsers.length !== store.users.length) {
             store.users = cleanUsers;
             migrated = true;
@@ -369,6 +369,11 @@ class StoreManager {
         returnDays = 3;
       }
 
+      // Do not automatically reset leads that have active scheduled follow-ups or are assigned
+      if (lead.nextFollowUpDate && new Date(lead.nextFollowUpDate).getTime() >= new Date(todayStr).getTime()) {
+        continue;
+      }
+
       if (returnDays !== null && lead.lastContactDate && lead.pipelineStage !== 'New Lead' && lead.pipelineStage !== 'Closed') {
         const callDate = new Date(lead.lastContactDate);
         const callDateStr = callDate.toISOString().split('T')[0];
@@ -456,12 +461,17 @@ class StoreManager {
 
   public async syncFromDatabase(): Promise<void> {
     try {
-      const [dbUsers, dbLeads] = await Promise.all([
-        prisma.user.findMany(),
-        prisma.lead.findMany({
-          where: { isDeleted: false },
-          orderBy: { createdAt: 'desc' },
-        }),
+      this.lastDbSyncTime = Date.now();
+      const [dbUsers, dbLeads] = await Promise.race([
+        Promise.all([
+          prisma.user.findMany(),
+          prisma.lead.findMany({
+            orderBy: { createdAt: 'desc' },
+          }),
+        ]),
+        new Promise<[any[], any[]]>((_, reject) =>
+          setTimeout(() => reject(new Error('Database sync timeout (10000ms)')), 10000)
+        ),
       ]);
 
       if (dbUsers.length > 0) {
@@ -520,6 +530,7 @@ class StoreManager {
       }
 
       if (dbLeads.length > 0) {
+        const dbLeadIds = new Set(dbLeads.map((l) => l.id));
         const leadMap = new Map(this.data.leads.map((l) => [l.id, l]));
 
         for (const l of dbLeads) {
@@ -568,19 +579,30 @@ class StoreManager {
           if (!existingMem) {
             leadMap.set(l.id, mappedDbLead);
           } else {
-            // Compare timestamps: Never overwrite newer in-memory assignments or status changes with stale DB reads!
-            const memUpdatedMs = new Date(existingMem.updatedAt).getTime();
-            const dbUpdatedMs = new Date(l.updatedAt).getTime();
-
-            if (dbUpdatedMs > memUpdatedMs) {
+            // Always respect database deletion status
+            if (l.isDeleted) {
               leadMap.set(l.id, mappedDbLead);
-            } else if (memUpdatedMs > dbUpdatedMs) {
-              // In-memory has pending changes (e.g. recent assignment or call outcome) - keep it and re-sync to DB
-              this.syncLeadToDatabase(existingMem).catch(() => {});
+            } else {
+              const memUpdatedMs = new Date(existingMem.updatedAt).getTime();
+              const dbUpdatedMs = new Date(l.updatedAt).getTime();
+
+              if (dbUpdatedMs >= memUpdatedMs) {
+                leadMap.set(l.id, mappedDbLead);
+              } else {
+                this.syncLeadToDatabase(existingMem).catch(() => {});
+              }
             }
           }
         }
-        this.data.leads = Array.from(leadMap.values());
+
+        // Only retain leads present in the database to prevent phantom records
+        const finalLeads: Lead[] = [];
+        for (const [id, lead] of leadMap.entries()) {
+          if (dbLeadIds.has(id)) {
+            finalLeads.push(lead);
+          }
+        }
+        this.data.leads = finalLeads;
       }
       this.lastDbSyncTime = Date.now();
       this.persist();
